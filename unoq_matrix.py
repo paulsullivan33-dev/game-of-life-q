@@ -1,0 +1,264 @@
+"""unoq_matrix.py -- driver for the Arduino Uno Q's built-in 8x13 LED matrix.
+
+The Uno Q carries a monochrome blue 8x13 LED matrix (104 pixels) driven by
+the onboard STM32U585 MCU. The working Linux transport uses the
+Arduino Router Bridge and the companion matrix-bridge sketch to send
+104 row-major brightness bytes to the MCU's draw RPC.
+
+The driver is fully optional by design:
+
+* Transport dependencies are imported lazily inside their constructors, so
+  importing this module does not require the bridge package or I2C hardware.
+* Unavailable dependencies, connections, and failed writes are reported as
+  DisplayUnavailable. Callers should catch it, warn, and run headless.
+
+Note: the matrix shows the boot logo for ~20-30 seconds during Linux
+startup; only touch it after the board has finished booting.
+
+Two transports exist. ``UnoQMatrix`` drives the matrix over I2C -- that
+path turned out to be dead on real hardware (no device answers at 0x70;
+the matrix is wired to the STM32 MCU, not the Linux I2C bus). It is kept
+for compatibility. ``BridgeMatrix`` is the working transport: it talks to
+the stock ``arduino-router`` daemon over its Unix socket using the
+``arduino-router-bridge`` pip package, calling the ``draw`` RPC exposed by
+the ``matrix-bridge`` sketch (see ``hardware/unoq-matrix-bridge/``).
+``create_matrix()`` tries the Bridge first and falls back to I2C.
+"""
+
+import time
+
+I2C_ADDR = 0x70
+COLS = 13
+ROWS = 8
+
+# 5x7 font, one entry per character: 5 column bytes, LSB = top pixel.
+# Covers A-Z, 0-9, and the punctuation used for status readouts.
+FONT_5X7 = {
+    " ": (0x00, 0x00, 0x00, 0x00, 0x00),
+    "0": (0x3E, 0x51, 0x49, 0x45, 0x3E),
+    "1": (0x00, 0x42, 0x7F, 0x40, 0x00),
+    "2": (0x42, 0x61, 0x51, 0x49, 0x46),
+    "3": (0x21, 0x41, 0x45, 0x4B, 0x31),
+    "4": (0x18, 0x14, 0x12, 0x7F, 0x10),
+    "5": (0x27, 0x45, 0x45, 0x45, 0x39),
+    "6": (0x3C, 0x4A, 0x49, 0x49, 0x30),
+    "7": (0x01, 0x71, 0x09, 0x05, 0x03),
+    "8": (0x36, 0x49, 0x49, 0x49, 0x36),
+    "9": (0x06, 0x49, 0x49, 0x29, 0x1E),
+    "A": (0x7E, 0x11, 0x11, 0x11, 0x7E),
+    "B": (0x7F, 0x49, 0x49, 0x49, 0x36),
+    "C": (0x3E, 0x41, 0x41, 0x41, 0x22),
+    "D": (0x7F, 0x41, 0x41, 0x22, 0x1C),
+    "E": (0x7F, 0x49, 0x49, 0x49, 0x41),
+    "F": (0x7F, 0x48, 0x48, 0x48, 0x40),
+    "G": (0x3E, 0x41, 0x49, 0x49, 0x7A),
+    "H": (0x7F, 0x08, 0x08, 0x08, 0x7F),
+    "I": (0x00, 0x41, 0x7F, 0x41, 0x00),
+    "J": (0x20, 0x40, 0x41, 0x3F, 0x01),
+    "K": (0x7F, 0x08, 0x14, 0x22, 0x41),
+    "L": (0x7F, 0x40, 0x40, 0x40, 0x40),
+    "M": (0x7F, 0x02, 0x0C, 0x02, 0x7F),
+    "N": (0x7F, 0x04, 0x08, 0x10, 0x7F),
+    "O": (0x3E, 0x41, 0x41, 0x41, 0x3E),
+    "P": (0x7F, 0x09, 0x09, 0x09, 0x06),
+    "Q": (0x3E, 0x41, 0x51, 0x21, 0x5E),
+    "R": (0x7F, 0x09, 0x19, 0x29, 0x46),
+    "S": (0x46, 0x49, 0x49, 0x49, 0x31),
+    "T": (0x01, 0x01, 0x7F, 0x01, 0x01),
+    "U": (0x7F, 0x40, 0x40, 0x40, 0x7F),
+    "V": (0x1F, 0x20, 0x40, 0x20, 0x1F),
+    "W": (0x3F, 0x40, 0x38, 0x40, 0x3F),
+    "X": (0x63, 0x14, 0x08, 0x14, 0x63),
+    "Y": (0x07, 0x08, 0x70, 0x08, 0x07),
+    "Z": (0x61, 0x51, 0x49, 0x45, 0x43),
+    ".": (0x00, 0x60, 0x60, 0x00, 0x00),
+    ",": (0x00, 0x50, 0x30, 0x00, 0x00),
+    ":": (0x00, 0x36, 0x36, 0x00, 0x00),
+    "/": (0x20, 0x10, 0x08, 0x04, 0x02),
+    "-": (0x08, 0x08, 0x08, 0x08, 0x08),
+    "_": (0x40, 0x40, 0x40, 0x40, 0x40),
+    "%": (0x62, 0x64, 0x08, 0x13, 0x23),
+    "+": (0x08, 0x08, 0x3E, 0x08, 0x08),
+    "!": (0x00, 0x00, 0x5F, 0x00, 0x00),
+    "?": (0x02, 0x01, 0x51, 0x09, 0x06),
+    "*": (0x14, 0x08, 0x3E, 0x08, 0x14),
+}
+
+
+class DisplayUnavailable(Exception):
+    """The LED matrix can't be reached. Callers should catch this, warn,
+    and continue without a display."""
+
+
+class UnoQMatrix:
+    """The Uno Q's built-in 8x13 LED matrix, via I2C from the Linux side.
+
+    Pass ``bus_obj`` (anything with ``write_i2c_block_data``) to drive a
+    fake in tests; otherwise smbus is imported lazily and the real bus is
+    opened. Raises DisplayUnavailable on any failure.
+    """
+
+    def __init__(self, bus_number=1, address=I2C_ADDR, bus_obj=None):
+        self.address = address
+        if bus_obj is not None:
+            self._bus = bus_obj
+        else:
+            try:
+                import smbus
+            except ImportError:
+                try:
+                    import smbus2 as smbus
+                except ImportError:
+                    smbus = None
+            if smbus is None:
+                raise DisplayUnavailable(
+                    "python3-smbus is not installed; cannot reach the LED matrix"
+                )
+            try:
+                self._bus = smbus.SMBus(bus_number)
+            except OSError as e:
+                raise DisplayUnavailable(f"cannot open I2C bus {bus_number}: {e}") from e
+        # Probe the device with a clear; a missing device fails here.
+        try:
+            self.clear()
+        except OSError as e:
+            raise DisplayUnavailable(
+                f"no LED matrix at I2C address 0x{address:02x}: {e}"
+            ) from e
+
+    def _write(self, columns):
+        """Write one 13-column frame; each value is a column, LSB = top."""
+        # game-of-life-q change vs the dual original: mask is 0xFF, not
+        # 0x7F -- the board has 8 rows, and bit 7 is the bottom row. (In
+        # dual the mask never mattered: its 5x7 font uses only 7 rows.)
+        frame = [(c & 0xFF) for c in list(columns)[:COLS]]
+        frame += [0x00] * (COLS - len(frame))
+        try:
+            self._bus.write_i2c_block_data(self.address, 0x00, frame)
+        except OSError as e:
+            raise DisplayUnavailable(f"I2C write failed: {e}") from e
+
+    def clear(self):
+        """Blank the matrix."""
+        self._write([0x00] * COLS)
+
+    @staticmethod
+    def render_text(text):
+        """Render text to a list of column bytes (5px glyph + 1px spacing).
+        Unknown characters fall back to '?'."""
+        cols = []
+        for ch in text.upper():
+            cols.extend(FONT_5X7.get(ch, FONT_5X7["?"]))
+            cols.append(0x00)
+        if cols:
+            cols.pop()  # no trailing space
+        return cols
+
+    def show_text(self, text, scroll_delay=0.1, scroll=True):
+        """Show text: static if it fits in 13 columns, otherwise one scroll
+        pass across the display. With scroll=False the text is written once
+        and stays on screen (anything past 13 columns is cut off)."""
+        cols = self.render_text(text)
+        if not scroll or len(cols) <= COLS:
+            self._write(cols)
+            return
+        pad = [0x00] * COLS
+        strip = pad + cols + pad
+        for i in range(len(strip) - COLS + 1):
+            self._write(strip[i:i + COLS])
+            time.sleep(scroll_delay)
+
+    def progress(self, done, total):
+        """Show a horizontal progress bar: `done` of `total` steps."""
+        total = max(1, total)
+        filled = min(COLS, max(0, round(COLS * done / total)))
+        self._write([0x7F] * filled + [0x00] * (COLS - filled))
+
+
+class BridgeMatrix(UnoQMatrix):
+    """The Uno Q's built-in 8x13 LED matrix, via the Arduino Router Bridge.
+
+    The working transport: the stock ``arduino-router`` daemon on the Q
+    bridges Linux to the STM32 MCU over a Unix socket, and the
+    ``matrix-bridge`` sketch (see ``hardware/unoq-matrix-bridge/``) exposes
+    a ``draw`` RPC taking 104 brightness bytes (8 rows x 13 cols,
+    row-major, 0-7).
+
+    Requires the ``arduino-router-bridge`` pip package; it is imported
+    lazily so importing this module stays safe everywhere. Raises
+    DisplayUnavailable on any failure so callers can fall back to headless.
+
+    The text/progress/clear interface is inherited from UnoQMatrix; only
+    the transport (``_write``) differs. ``__init__`` deliberately skips
+    UnoQMatrix's I2C setup.
+    """
+
+    ROWS = 8
+    ON_BRIGHTNESS = 7  # full with the sketch's setGrayscaleBits(3)
+
+    def __init__(self, bridge=None):
+        # Deliberately does not call UnoQMatrix.__init__: that sets up the
+        # dead I2C transport, which this class replaces entirely. The shared
+        # text/progress/clear logic is still inherited.
+        # pylint: disable=super-init-not-called
+        if bridge is None:
+            try:
+                from arduino.router_bridge import Bridge
+            except ImportError as exc:
+                raise DisplayUnavailable(
+                    "arduino-router-bridge is not installed "
+                    "(pip install arduino-router-bridge)"
+                ) from exc
+            bridge = Bridge()
+        self._bridge = bridge
+        try:
+            connected = self._bridge.connect(timeout=5)
+        except Exception as e:
+            raise DisplayUnavailable(
+                f"cannot reach the Arduino router: {e}"
+            ) from e
+        if not connected:
+            raise DisplayUnavailable(
+                "no Arduino router at unix:///var/run/arduino-router.sock"
+            )
+        # Probe the sketch the way UnoQMatrix probes I2C: a clear that fails
+        # here (e.g. RPC "no client provides the method") means the sketch
+        # isn't flashed yet.
+        self.clear()
+
+    def _write(self, columns):
+        """Convert 13 column bytes (LSB = top pixel) to 104 row-major
+        brightness bytes and send them to the sketch's ``draw`` RPC."""
+        cols = [(c & 0xFF) for c in list(columns)[:COLS]]  # 0xFF: see _write
+        cols += [0x00] * (COLS - len(cols))
+        frame = bytearray(self.ROWS * COLS)
+        for ci, byte in enumerate(cols):
+            for r in range(self.ROWS):
+                frame[r * COLS + ci] = (
+                    self.ON_BRIGHTNESS if (byte >> r) & 1 else 0
+                )
+        try:
+            self._bridge.call("draw", bytes(frame), timeout=5)
+        except Exception as e:
+            raise DisplayUnavailable(f"bridge draw call failed: {e}") from e
+
+
+def create_matrix():
+    """Return the best available LED matrix driver.
+
+    Tries the Router Bridge transport first (the working one), then the
+    legacy I2C driver. Raises DisplayUnavailable if neither works; the
+    error names the bridge failure since that's the actionable one (flash
+    the sketch / install the pip package).
+    """
+    try:
+        return BridgeMatrix()
+    except DisplayUnavailable as e:
+        bridge_err = e
+    try:
+        return UnoQMatrix()
+    except DisplayUnavailable:
+        pass
+    raise DisplayUnavailable(
+        f"no working LED matrix transport ({bridge_err})"
+    )
