@@ -19,6 +19,7 @@ Examples:
 """
 
 import argparse
+import math
 import sys
 import time
 
@@ -90,8 +91,14 @@ def main(argv=None):
         help="render in the terminal instead of on the LED matrix",
     )
     args = parser.parse_args(argv)
-    if args.fps <= 0:
-        parser.error("--fps must be positive")
+    if not math.isfinite(args.fps) or args.fps <= 0:
+        parser.error("--fps must be a finite positive number")
+    if args.max_generations < 1:
+        parser.error("--max-generations must be at least 1")
+    if args.min_generations < 1:
+        parser.error("--min-generations must be at least 1")
+    if args.min_generations > args.max_generations:
+        parser.error("--min-generations must not exceed --max-generations")
 
     matrix = None if args.terminal else open_matrix()
     cycler = life.Cycler(
