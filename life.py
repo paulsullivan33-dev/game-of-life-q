@@ -188,6 +188,13 @@ class Cycler:
     ``patterns`` may inject a custom [(name, cells), ...] sequence
     (the tests use it); by default the library from build_patterns()
     is used and the soup is re-seeded on every lap.
+
+    The generation bounds must satisfy
+    ``1 <= min_generations <= max_generations``. The minimum is a floor
+    on how long a pattern stays up, not an override of the cap: with
+    contradictory bounds (a minimum above the maximum) the run would
+    silently exceed the requested maximum, so they are rejected here
+    for every caller, not just the CLI.
     """
 
     def __init__(
@@ -197,6 +204,19 @@ class Cycler:
         min_generations=DEFAULT_MIN_GENERATIONS,
         seed=0,
     ):
+        if max_generations < 1:
+            raise ValueError(
+                f"max_generations must be at least 1, got {max_generations!r}"
+            )
+        if min_generations < 1:
+            raise ValueError(
+                f"min_generations must be at least 1, got {min_generations!r}"
+            )
+        if min_generations > max_generations:
+            raise ValueError(
+                f"min_generations ({min_generations!r}) must not exceed "
+                f"max_generations ({max_generations!r})"
+            )
         self._fixed = patterns
         self.max_generations = max_generations
         self.min_generations = min_generations

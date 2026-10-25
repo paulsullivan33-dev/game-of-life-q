@@ -161,5 +161,68 @@ class CyclerTests(unittest.TestCase):
         self.assertEqual(frames[16][0], "Glider")
 
 
+class CyclerValidationTests(unittest.TestCase):
+    """F13: contradictory or nonpositive generation bounds are rejected.
+
+    Before the validation, min_generations=6 with max_generations=2 ran
+    a pattern for 6 generations -- the minimum guards every exit check,
+    including the cap, so the run silently exceeded the requested max.
+    """
+
+    def test_min_above_max_is_rejected(self):
+        with self.assertRaises(ValueError):
+            life.Cycler(min_generations=6, max_generations=2)
+
+    def test_nonpositive_bounds_are_rejected(self):
+        for kwargs in (
+            {"min_generations": 0},
+            {"min_generations": -1},
+            {"max_generations": 0},
+            {"max_generations": -3},
+            {"min_generations": 0, "max_generations": 0},
+        ):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    life.Cycler(**kwargs)
+
+    def test_min_equal_max_is_valid_and_obeys_the_cap(self):
+        cycler = life.Cycler(
+            patterns=[("Block", life.BLOCK), ("Blinker", life.BLINKER)],
+            min_generations=2,
+            max_generations=2,
+        )
+        frames_iter = cycler.frames()
+        frames = [next(frames_iter) for _ in range(3)]
+        generations = [gen for _, _, gen in frames]
+        self.assertEqual(generations[:2], [0, 1])
+        self.assertEqual(frames[2][0], "Blinker")
+
+
+class CliValidationTests(unittest.TestCase):
+    """The CLI rejects nonfinite/nonpositive fps and bad bounds (F13)."""
+
+    def assert_cli_error(self, argv):
+        import q_life
+
+        with self.assertRaises(SystemExit) as caught:
+            q_life.main(argv)
+        self.assertEqual(caught.exception.code, 2)
+
+    def test_bad_fps_values(self):
+        for fps in ("0", "-1", "nan", "inf", "-inf"):
+            with self.subTest(fps=fps):
+                self.assert_cli_error(["--fps", fps, "--terminal"])
+
+    def test_contradictory_generation_bounds(self):
+        self.assert_cli_error(
+            ["--max-generations", "2", "--min-generations", "6", "--terminal"]
+        )
+
+    def test_nonpositive_generation_bounds(self):
+        self.assert_cli_error(["--max-generations", "0", "--terminal"])
+        self.assert_cli_error(["--min-generations", "0", "--terminal"])
+        self.assert_cli_error(["--min-generations", "-2", "--terminal"])
+
+
 if __name__ == "__main__":
     unittest.main()
